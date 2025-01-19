@@ -1,0 +1,387 @@
+import pandas as pd
+import torch 
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import math 
+def max_pairs(text):
+    max = 0
+    pairs = {(text[0],text[1]):1}
+    max_pair = (text[0],text[1])
+    for i in range (1,len(text)-1):
+        pairs.setdefault((text[i],text[i+1]),0)
+        pairs[(text[i],text[i+1])] += 1
+        if (pairs[(text[i],text[i+1])]>max):
+            max_pair = (text[i],text[i+1])
+            max = pairs[(text[i],text[i+1])]
+            
+    return max_pair
+
+def merge(max_pair,text):
+    merged_text = []
+    i = 0
+    
+    while i < len(text):
+            if i < len(text) - 1 and text[i] == max_pair[0] and text[i + 1] == max_pair[1]:
+                merged_text.append(''.join((text[i],text[i+1])))
+                i+=2
+                        
+            else:
+                merged_text.append(text[i])
+                i+=1
+    return merged_text
+    
+   
+def bpe_tokenizer(text):
+    target_vocab = len(set(text))
+    while(len(text)>target_vocab):
+        pair = max_pairs(text)
+        text = merge(pair,text)
+ 
+    return(text)
+
+def make_list_from_string(string):
+    list = []
+    for char in string:
+        list.append(char)
+    
+    return list
+
+def main_vocab_gen(conv_text,main_vocab,main_tokens,starting):
+    
+    for c in conv_text:
+        if c not in main_vocab:
+            main_vocab.setdefault(c,starting)
+            main_tokens.setdefault(starting,c)
+            starting+=1
+#conv_text is a dictionary
+def text_to_token(conv_text,main_vocab):
+    tokens = []
+    for c in conv_text:
+        if c in main_vocab:
+            tokens.append(main_vocab[c])
+
+        else:
+            tokens.append(main_vocab["unk"])
+
+    return tokens
+    
+def token_to_text(tokens,main_tokens):
+    text = []
+    for t in tokens:
+        text.append(main_tokens[t])
+    print (text)
+    return text
+
+
+def encoding_prep(max_len,tokens):
+    encode = [0]*(max_len-len(tokens))
+    final_tokens = tokens + encode
+    return final_tokens
+    
+
+
+class input_Embedding(nn.Module):
+    def __init__(self, vocab_size: int, dim: int):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, dim, padding_idx=0)
+        unk_index = 1
+        with torch.no_grad():
+            self.embedding.weight[unk_index] = torch.zeros(dim, dtype=torch.float16)  # Ensure dtype is float16
+
+    def forward(self, input):
+        input = input.to(torch.long)  # Ensure input is long for embedding lookup
+        embedding = self.embedding(input).to(torch.float16)  # Ensure embedding is float16
+        return embedding 
+
+class m_h_a(nn.Module):
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        self.wq = nn.Linear(dim, dim)
+        self.wk = nn.Linear(dim, dim)
+        self.wv = nn.Linear(dim, dim)
+        self.wo = nn.Linear(dim, dim)
+        self.num_heads = num_heads
+        self.dim = dim
+
+    def forward(self, ie):
+        ie = ie.to(torch.float16)  # Ensure input is float16
+        q = self.wq(ie)
+        k = self.wk(ie)
+        v = self.wv(ie)
+        d_k = self.dim // self.num_heads  # Using integer division
+        q = q.view(q.shape[0], q.shape[1], self.num_heads, d_k).transpose(1, 2)
+        k = k.view(k.shape[0], k.shape[1], self.num_heads, d_k).transpose(1, 2)
+        v = v.view(v.shape[0], v.shape[1], self.num_heads, d_k).transpose(1, 2)
+        attention_scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(d_k)
+        attention_scores = torch.softmax(attention_scores, dim=-1)
+        weighted_matrix = torch.matmul(attention_scores, v)
+        weighted_matrix = weighted_matrix.transpose(1, 2).contiguous()
+        weighted_matrix = weighted_matrix.view(weighted_matrix.shape[0], weighted_matrix.shape[1], d_k * self.num_heads)
+        final_mha_output = self.wo(weighted_matrix)
+        return final_mha_output
+
+class FeedForward(nn.Module):
+    def __init__(self, dim: int, d_ff: int, dropout_rate: float = 0.1):
+        super(FeedForward, self).__init__()
+        self.layer_1 = nn.Linear(dim, d_ff)
+        self.activation_1 = nn.GELU()
+        self.dropout = nn.Dropout(dropout_rate)
+        self.layer_2 = nn.Linear(d_ff, dim)
+
+    def forward(self, input):
+        input = input.to(torch.float16)  # Ensure input is float16
+        output = self.layer_1(input)
+        output = self.activation_1(output)
+        output = self.dropout(output)
+        output = self.layer_2(output)
+        return output
+
+class add_and_norm(nn.Module):
+    def __init__(self, dim: int):
+        super(add_and_norm, self).__init__()
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+
+    def forward(self, mha_input):
+        mha_input = mha_input.to(torch.float16)  # Ensure input is float16
+        input = self.norm(mha_input)
+        return input + mha_input
+
+class pooling(nn.Module):
+    def __init__(self, dim: int):
+        super(pooling, self).__init__()
+        self.pooling = nn.Linear(dim, 1)
+
+    def forward(self, input):
+        input = input.to(torch.float16)  # Ensure input is float16
+        weights = self.pooling(input)
+        attention_scores = torch.softmax(weights, dim=-1)
+        weighted_sum = input * attention_scores
+        return weighted_sum.sum(dim=1)
+
+class output_layer(nn.Module):
+    def __init__(self, dim: int, num_output_labels: int):
+        super(output_layer, self).__init__()
+        self.output = nn.Linear(dim, num_output_labels)
+
+    def forward(self, input):
+        input = input.to(torch.float16)  # Ensure input is float16
+        return self.output(input)
+
+class mto(nn.Module):
+    def __init__(self, emb: input_Embedding, mha: m_h_a, ff: FeedForward, ann: add_and_norm, pooling: pooling, ol: output_layer, dim: int, d_ff: int, num_heads: int, max_sl: int, num_blocks: int, vocab_s: int, num_out_l: int, batch_size: int):
+        super(mto, self).__init__()
+        self.embed = emb
+        self.mha = nn.ModuleList([mha(dim, num_heads) for _ in range(num_blocks)])
+        self.ff = nn.ModuleList([ff(dim, d_ff) for _ in range(num_blocks)])
+        self.ann = nn.ModuleList([ann(dim) for _ in range(num_blocks * 2)])
+        self.pool = pooling(dim)
+        self.ol = ol(dim, num_out_l)
+        self.dim = dim
+        self.max_sl = max_sl
+        self.batch_size = batch_size
+        self.num_blocks = num_blocks
+
+    @staticmethod
+    def positional_encoding(num_seq, dim, max_seq_length):
+        pe = torch.zeros(num_seq, max_seq_length, dim, dtype=torch.float16)
+        for seq in range(num_seq):
+            for pos in range(max_seq_length):
+                for i in range(dim):
+                    if i % 2 == 0:
+                        pe[seq, pos, i] = np.sin(pos / (10000 ** (2 * i / dim)))
+                    else:
+                        pe[seq, pos, i] = np.cos(pos / (10000 ** (2 * i / dim)))
+        return pe
+
+    def forward(self, inp):
+        inp = inp.to(torch.long)  # Ensure input is long for embedding lookup
+        pe = self.positional_encoding(self.batch_size, self.dim, self.max_sl)
+        inp = pe + self.embed(inp,self.dim)
+        for i in range(self.num_blocks):
+            inp = self.mha[i](inp)
+            inp = self.ann[i * 2](inp)
+            inp = self.ff[i](inp)
+            inp = self.ann[i * 2 + 1](inp)
+        inp = self.pool(inp)
+        final_output = self.ol(inp)
+        return final_output.view(final_output.shape[0], num_out_l)
+
+
+class Training_Validation:
+    def __init__(self, num_seq: int, batch_size: int, model: nn.Module, loss_f=None, optimizer=None, epochs: int=1):
+        self.model = model
+        self.loss_f = loss_f if loss_f is not None else nn.CrossEntropyLoss()
+        self.optimizer = optimizer if optimizer is not None else optim.Adam(model.parameters(), lr=0.001)
+        self.epochs = epochs
+        
+    def train(self, inp_tokens: torch.Tensor, target_prob: torch.Tensor, num_seq: int):
+        self.model.train()
+        epoch_size = num_seq / batch_size
+        epoch_size = int(epoch_size)
+        for epoch in range(self.epochs):
+            indices = torch.randperm(inp_tokens.size(0))
+            inp_tokens = inp_tokens[indices]
+            target_tokens = target_prob[indices]
+            for j in range(1, epoch_size):
+                input_batch = inp_tokens[(j - 1) * batch_size:j * batch_size, :].to(torch.float16)
+                batch_target = target_tokens[(j - 1) * batch_size:j * batch_size].to(torch.long)
+                self.optimizer.zero_grad()
+                outputs = self.model(input_batch)
+                loss = self.loss_f(outputs, batch_target)
+                loss.backward()
+                self.optimizer.step()
+    
+    def eval(self, inp_tokens: torch.Tensor, target_prob: torch.Tensor, num_seq:int):
+        self.model.eval()
+        epoch_size = int(num_seq / batch_size)
+        final_loss = 0.0
+        for j in range(1, epoch_size):
+            eval_input_batch = inp_tokens[(j - 1) * batch_size:j * batch_size, :].to(torch.float16)
+            eval_batch_target = target_prob[(j - 1) * batch_size:j * batch_size].to(torch.long)
+            eval_outputs = self.model(eval_input_batch)
+            final_loss += self.loss_f(eval_outputs, eval_batch_target).item()
+        return final_loss / epoch_size
+
+class Training_Validation:
+    def __init__(self, num_seq: int, batch_size: int, model: nn.Module, loss_f=None, optimizer=None, epochs: int=1):
+        self.model = model
+        self.loss_f = loss_f if loss_f is not None else nn.CrossEntropyLoss()
+        self.optimizer = optimizer if optimizer is not None else optim.Adam(model.parameters(), lr=0.001)
+        self.epochs = epochs
+        
+    def train(self, inp_tokens: torch.Tensor, target_prob: torch.Tensor, num_seq: int):
+        self.model.train
+        epoch_size = num_seq / batch_size
+        epoch_size = int(epoch_size)
+        for epoch in range(self.epochs):
+            indices = torch.randperm(inp_tokens.size(0))
+            inp_tokens = inp_tokens[indices]
+            target_tokens = target_prob[indices]
+            for j in range(1, epoch_size):
+                input_batch = inp_tokens[(j - 1) * batch_size:j * batch_size, :].to(torch.float16)
+                batch_target = target_tokens[(j - 1) * batch_size:j * batch_size].to(torch.long)
+                self.optimizer.zero_grad()
+                outputs = self.model(input_batch)
+                loss = self.loss_f(outputs, batch_target)
+                loss.backward()
+                self.optimizer.step()
+    
+    def eval(self, inp_tokens: torch.Tensor, target_prob: torch.Tensor, num_seq:int):
+        self.model.eval()
+        epoch_size = int(num_seq / batch_size)
+        final_loss = 0.0
+        for j in range(1, epoch_size):
+            eval_input_batch = inp_tokens[(j - 1) * batch_size:j * batch_size, :].to(torch.float16)
+            eval_batch_target = target_prob[(j - 1) * batch_size:j * batch_size].to(torch.long)
+            eval_outputs = self.model(eval_input_batch)
+            final_loss += self.loss_f(eval_outputs, eval_batch_target).item()
+        return final_loss / epoch_size
+
+
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print(f"Memory allocated: {torch.mps.current_allocated_memory()} bytes")
+    print(f"Max memory allocated: {torch.mps.driver_allocated_memory} bytes")
+else:
+    print ("MPS device not found.")
+
+import pandas as pd
+
+column_names = [ 'id', 'topic', 'sentiment', 'text']
+data = pd.read_csv('twitter_training.csv',names=column_names)
+data_eval = pd.read_csv('twitter_validation.csv',names=column_names)
+
+target_output = torch.zeros(len(data),len(set(data["sentiment"])))
+
+data.drop('topic',axis=1,inplace=True)
+data.drop('id',axis =1,inplace=True)
+data = data.dropna().reset_index(drop=True)
+
+
+data_eval.drop('topic',axis = 1,inplace=True)
+data_eval.drop('id',axis = 1,inplace=True)
+data_eval = data_eval.dropna().reset_index(drop=True)
+
+target_sentiment = {}#target vocab
+target_tokens = {}# contains token to target
+target_sentiment.setdefault("unk",0)#setting 1st 2 
+starting_2 = 1
+main_vocab_gen(set(data["sentiment"]),target_sentiment,target_tokens,starting_2)
+list = [data["sentiment"][1]]
+target_output = torch.zeros(len(data),len(target_sentiment))
+target_output[2][(text_to_token(list,target_sentiment)[0])] = 1
+
+main_vocab = {}#training set vocab
+tokens = {}#tokens contains token to vocab mapping for training set
+
+main_vocab.setdefault("pad",0)#setting 1st 2 
+main_vocab.setdefault("unk",1)
+tokens.setdefault(0,"pad")
+tokens.setdefault(1,"unk")
+starting_1 = 2
+starting_2 = 1
+
+target_sentiment = {}#target vocab
+target_tokens = {}# contains token to target
+target_sentiment.setdefault("unk",0)#setting 1st 2 
+
+training_data = []
+eval_data = []
+
+data['text'] = data['text'].astype('string')
+data['sentiment'] = data['text'].astype('string')
+data['len'] = data['text'].apply(lambda x :len(x))
+max_len = data['len'].max()
+
+for review in data['text'][:1800]:
+    t = bpe_tokenizer(review)
+    main_vocab_gen(t, main_vocab, tokens,starting_1)
+    training_data.append(encoding_prep(max_len,text_to_token(t,main_vocab)))
+
+
+print(len(training_data))
+data_eval['text'] = data_eval['text'].astype('string')
+data_eval['sentiment'] = data_eval['text'].astype('string')
+data_eval['len'] = data_eval['text'].apply(lambda x :len(x))
+max_len_eval = data_eval['len'].max()
+for review in data_eval['text'][:900]:
+    t_eval = bpe_tokenizer(review)
+    eval_data.append(encoding_prep(max_len_eval,text_to_token(t_eval,main_vocab)))
+
+
+main_vocab_gen(set(data["sentiment"]),target_sentiment,target_tokens,starting_2)
+target_output = torch.empty(len(data['sentiment']))
+for i in range(len(data['sentiment'])):
+    target_output[i]=text_to_token(data['sentiment'][i],target_sentiment)[0] 
+eval_output = torch.empty(len(data_eval['sentiment']))
+for i in range(len(data_eval['sentiment'])):
+    eval_output[i]=text_to_token(data_eval['sentiment'][i],target_sentiment)[0]
+    
+target_output = target_output.long()
+eval_output = eval_output.long()
+
+batch_size = 90 
+dim = 256  
+d_ff = 1024  
+num_heads = 4  
+num_blocks = 3  
+
+num_out_l = len(set(data["sentiment"]))
+max_sl = max(max_len,max_len_eval)
+vocab_s = len(main_vocab)
+# Convert training and evaluation tensors to float16
+training_tensor = torch.tensor(training_data, dtype=torch.float16)
+eval_tensor = torch.tensor(eval_data, dtype=torch.float16)
+
+print(len(training_tensor))
+
+
+model = mto(input_Embedding, m_h_a, FeedForward, add_and_norm, pooling, output_layer, dim, d_ff, num_heads, max_sl, num_blocks, vocab_s, num_out_l, batch_size)
+
+trainer = Training_Validation(1800, batch_size=90, model=model, epochs=2,loss_f = None, optimizer = None)
+trainer.train(training_tensor, target_output.to(device), 1800)
+l = trainer.eval(eval_tensor, eval_output.to(device), 900)
+print(l) 
+
+ 
